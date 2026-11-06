@@ -113,17 +113,27 @@ def unwrap_runner_output(output):
     return output
 
 
-def check_single_valued(merged, keys=("gen_filter_eff", "production")):
-    """Raise if a merged sample's chunks disagreed on a per-sample setting: each chunk is
-    normalized with its own value, so a mixture would be summed without warning."""
-    for sample, sout in merged.items():
-        if not isinstance(sout, dict) or "metadata" not in sout:
-            continue
-        for key in keys:
-            values = sout["metadata"].get(key)
-            if values is not None and len(values) > 1:
-                raise ValueError(f"{sample}: chunks disagree on {key}: {sorted(values, key=str)}; "
-                                 "not merging (re-run the odd chunks with the same setting)")
+def check_chunk_normalization(outputs, keys=("gen_filter_eff", "production")):
+    """Check each sample's settings before accumulation can hide a missing key.
+
+    All-legacy chunks may omit a key, but cannot mix with chunks that record it.
+    A present key must contain exactly one value, consistent across the sample.
+    """
+    settings = {}
+    for output in outputs:
+        for sample, sout in output.items():
+            if not isinstance(sout, dict) or "metadata" not in sout:
+                continue
+            expected = settings.setdefault(sample, {})
+            for key in keys:
+                values = sout["metadata"].get(key)
+                if key in sout["metadata"] and (values is None or len(values) != 1):
+                    raise ValueError(f"{sample}: {key} must contain exactly one value")
+                setting = None if values is None else frozenset(values)
+                if key in expected and setting != expected[key]:
+                    raise ValueError(f"{sample}: chunks disagree on {key} (value or presence); "
+                                     "not merging (re-run the odd chunks with the same setting)")
+                expected[key] = setting
 
 
 def combine_normalized_chunks(outputs, unweighted_override=None):
@@ -138,7 +148,8 @@ def combine_normalized_chunks(outputs, unweighted_override=None):
         sum_j(obj_j*sumw_j) / sum_j(sumw_j)  ==  lumi*xs*eff/sumw_full * sum_j raw_j   (the right answer).
     Data, and raw (unweighted) hists, are left to plain accumulation.
     Runner-wrapped chunks are unwrapped first (unwrap_runner_output), and chunks of one sample
-    that disagree on gen_filter_eff or production raise instead of merging.
+    that disagree on gen_filter_eff or production (including missing keys in only some chunks)
+    raise before any input is re-weighted. Chunks that all lack a key remain supported.
 
     unweighted_override is only for OLD outputs whose metadata predates the 'unweighted_hist' key;
     newer runs store it, so the merge is self-describing.
@@ -160,6 +171,7 @@ def combine_normalized_chunks(outputs, unweighted_override=None):
         return True, (not unweighted)                 # (scale_cutflow, scale_hists)
 
     outputs = [unwrap_runner_output(out) for out in outputs]
+    check_chunk_normalization(outputs)
     for out in outputs:
         for sout in out.values():
             if not isinstance(sout, dict) or "metadata" not in sout:
@@ -176,7 +188,6 @@ def combine_normalized_chunks(outputs, unweighted_override=None):
                     sout["hists"][n] = sout["hists"][n] * sumw
 
     merged = processor.accumulate(outputs)
-    check_single_valued(merged)
 
     for sout in merged.values():
         if not isinstance(sout, dict) or "metadata" not in sout:
